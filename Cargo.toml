@@ -2,12 +2,11 @@
 name = "hauru-top"
 version = "1.2.1"
 edition = "2021"
-description = "Tableau de bord terminal pour la station Hauru (portage Rust)"
+description = "Tableau de bord terminal Linux : CPU, GPU, PCIe, NVLink et capteurs"
 license = "MIT"
 authors = ["Stéphane Denis"]
 repository = "https://github.com/stephanedenis/hauru-top"
 homepage = "https://github.com/stephanedenis/hauru-top"
-publish = false
 
 [dependencies]
 crossterm = "0.28"

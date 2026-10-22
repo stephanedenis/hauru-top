@@ -85,7 +85,7 @@ pub struct Qpi {
     pub reason: Option<String>,
 }
 
-/// Carte AMD pilotée par amdgpu (activité non exposée sur Cape Verde).
+/// Carte AMD suivie via amdgpu/sysfs, selon les capteurs exposés.
 #[derive(Clone, Debug, Default)]
 pub struct Amd {
     pub name: String,

@@ -596,7 +596,14 @@ fn side_by_side(left: &[Line], right: &[Line], gap: usize) -> Vec<Line> {
         .collect()
 }
 
-fn header_block(m: &Metrics, width: usize, clock: &str, dot: Rgb, glyphs: &Glyphs) -> Vec<Line> {
+fn header_block(
+    m: &Metrics,
+    width: usize,
+    clock: &str,
+    dot: Rgb,
+    glyphs: &Glyphs,
+    app_title: &str,
+) -> Vec<Line> {
     let content_width = width.saturating_sub(4);
     let gap = 3;
     let budget = 20.max(content_width.saturating_sub(2 * gap) / 3);
@@ -667,9 +674,9 @@ fn header_block(m: &Metrics, width: usize, clock: &str, dot: Rgb, glyphs: &Glyph
     }
     row2.pad_to(content_width);
 
-    let mut title = Line::new();
-    title.push(glyphs.dot(), Style::fg(dot));
-    title.push(" HAURU", Style::strong(TITLE));
+    let mut title_line = Line::new();
+    title_line.push(glyphs.dot(), Style::fg(dot));
+    title_line.push(&format!(" {app_title}"), Style::strong(TITLE));
 
     let right_candidates = vec![
         Line::from_text(
@@ -687,9 +694,16 @@ fn header_block(m: &Metrics, width: usize, clock: &str, dot: Rgb, glyphs: &Glyph
         ),
         Line::from_text(clock, Style::fg(DIM)),
     ];
-    let max_right = width.saturating_sub(2 + title.width() + 8);
+    let max_right = width.saturating_sub(2 + title_line.width() + 8);
     let right = choose(right_candidates, max_right);
-    card(width, 4, &title, right.as_ref(), vec![row1, row2], glyphs)
+    card(
+        width,
+        4,
+        &title_line,
+        right.as_ref(),
+        vec![row1, row2],
+        glyphs,
+    )
 }
 
 impl Line {
@@ -1426,6 +1440,7 @@ pub fn build_frame(
     paused: bool,
     clock: &str,
     glyphs: &Glyphs,
+    app_title: &str,
 ) -> Vec<Line> {
     let lines = if width < MIN_WIDTH || height < MIN_HEIGHT {
         too_small(width, height, glyphs)
@@ -1440,7 +1455,7 @@ pub fn build_frame(
         } else {
             GREEN
         };
-        blocks.push(header_block(m, width, clock, dot, glyphs));
+        blocks.push(header_block(m, width, clock, dot, glyphs, app_title));
 
         let half_left = (width - 2) / 2;
         let half_right = width - 2 - half_left;

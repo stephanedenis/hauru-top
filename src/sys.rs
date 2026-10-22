@@ -501,7 +501,7 @@ pub fn read_gpus(nvml: &mut Option<Nvml>) -> (Vec<Gpu>, Option<String>, f64) {
     (gpus, None, latency)
 }
 
-/// État, vitesse et erreurs NVLink ; le débit n'est pas exposé sur Turing.
+/// État, vitesse et erreurs NVLink ; le débit dépend du GPU et du pilote.
 pub fn read_nvlink() -> NvLink {
     let mut speed: Option<f64> = None;
     let mut lines = 0usize;
@@ -547,48 +547,23 @@ pub fn read_nvlink() -> NvLink {
     }
 }
 
-fn command_exists(name: &str) -> bool {
-    std::env::var_os("PATH")
-        .map(|paths| std::env::split_paths(&paths).any(|dir| dir.join(name).is_file()))
-        .unwrap_or(false)
-}
-
-/// Topologie QPI connue ; le débit exige perf et des privilèges.
+/// Topologie QPI/UPI générique : le noyau n'expose pas les liens de façon
+/// portable, on affiche les sockets et l'absence de détail.
 pub fn read_qpi(topology: &Topology) -> Qpi {
-    let mut links = None;
-    let mut speed = None;
-    if topology.model.contains("E5-2687W v3") {
-        links = Some(2);
-        speed = Some(9.6);
-    }
-    let reason = if links.is_none() {
-        Some("modèle inconnu".to_string())
-    } else if !command_exists("perf") {
-        Some("perf absent".to_string())
-    } else {
-        let paranoid = fs::read_to_string("/proc/sys/kernel/perf_event_paranoid")
-            .ok()
-            .and_then(|value| value.trim().parse::<i32>().ok())
-            .unwrap_or(2);
-        Some(if paranoid > 1 {
-            "perf restreint".to_string()
-        } else {
-            "intégration perf non faite".to_string()
-        })
-    };
     Qpi {
         sockets: topology.packages.len(),
-        links,
-        speed_gt_s: speed,
+        links: None,
+        speed_gt_s: None,
         traffic: None,
-        reason,
+        reason: Some("topologie QPI non exposée".to_string()),
     }
 }
 
-fn amd_name(pci_id: &str) -> &'static str {
-    match pci_id {
-        "1002:683f" => "Radeon HD 7750",
-        _ => "AMD GPU",
+fn amd_name(pci_id: &str) -> String {
+    if pci_id.is_empty() {
+        "AMD GPU".to_string()
+    } else {
+        format!("AMD GPU ({pci_id})")
     }
 }
 

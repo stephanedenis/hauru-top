@@ -1,4 +1,4 @@
-//! hauru-top — tableau de bord terminal de la station Hauru (portage Rust).
+//! hauru-top — tableau de bord terminal pour station Linux.
 
 mod model;
 mod sys;
@@ -13,6 +13,7 @@ use std::io::{self, IsTerminal, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const APP: &str = "hauru-top";
 const VERSION: &str = "1.2.1";
@@ -31,6 +32,7 @@ struct Args {
     height: Option<u16>,
     color: ColorChoice,
     ascii: bool,
+    title: Option<String>,
 }
 
 impl Default for Args {
@@ -42,6 +44,7 @@ impl Default for Args {
             height: None,
             color: ColorChoice::Auto,
             ascii: false,
+            title: None,
         }
     }
 }
@@ -58,6 +61,7 @@ fn print_help() {
          \x20       --height <LIGNES>      hauteur forcée\n\
          \x20       --color <MODE>         auto, always ou never\n\
          \x20       --ascii               bordures et barres en ASCII\n\
+         \x20       --title <NOM>         nom affiché (défaut : nom d'hôte)\n\
          \x20   -h, --help                cette aide\n\
          \x20       --version             version\n\n\
          TOUCHES:\n\
@@ -84,6 +88,13 @@ fn parse_args() -> Result<Args, String> {
             }
             "--once" => args.once = true,
             "--ascii" => args.ascii = true,
+            "--title" => {
+                args.title = Some(
+                    inline
+                        .or_else(|| arguments.next())
+                        .ok_or_else(|| "valeur manquante pour --title".to_string())?,
+                );
+            }
             "-i" | "--interval" => {
                 let value = inline
                     .or_else(|| arguments.next())
@@ -239,11 +250,12 @@ fn run_once(
     args: &Args,
     glyphs: &Glyphs,
     color: ColorMode,
+    title: &str,
 ) -> io::Result<()> {
     sampler.prime();
     let (width, height) = terminal_size(args);
     let clock = local_clock();
-    let frame = ui::build_frame(&sampler, width, height, false, &clock, glyphs);
+    let frame = ui::build_frame(&sampler, width, height, false, &clock, glyphs, title);
     print!("{}", ui::render_once(&frame, color));
     println!();
     if let Some(error) = sampler.metrics.as_ref().and_then(|m| m.gpu_error.as_ref()) {
@@ -257,6 +269,7 @@ fn run_live(
     args: &Args,
     glyphs: &Glyphs,
     color: ColorMode,
+    title: &str,
 ) -> io::Result<()> {
     let stop = Arc::new(AtomicBool::new(false));
     let _ = signal_hook::flag::register(SIGTERM, Arc::clone(&stop));
@@ -271,7 +284,15 @@ fn run_live(
             break;
         }
         let (width, height) = terminal_size(args);
-        let frame = ui::build_frame(&sampler, width, height, paused, &local_clock(), glyphs);
+        let frame = ui::build_frame(
+            &sampler,
+            width,
+            height,
+            paused,
+            &local_clock(),
+            glyphs,
+            title,
+        );
         draw(&frame, color)?;
 
         let deadline = Instant::now() + sampler.interval;
@@ -333,6 +354,35 @@ fn run_live(
     Ok(())
 }
 
+fn default_title() -> String {
+    std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .ok()
+        .map(|host| host.trim().to_string())
+        .filter(|host| !host.is_empty())
+        .or_else(|| std::env::var("HOSTNAME").ok())
+        .unwrap_or_else(|| APP.to_string())
+}
+
+/// Nettoie et borne le nom affiché dans l'en-tête.
+fn display_title(text: &str) -> String {
+    let cleaned: String = text.chars().filter(|ch| !ch.is_control()).collect();
+    let cleaned = cleaned.trim();
+    let source = if cleaned.is_empty() { APP } else { cleaned };
+    let mut out = String::new();
+    for ch in source.chars() {
+        let width = ch.width().unwrap_or(0);
+        if out.width() + width > 28 {
+            break;
+        }
+        out.push(ch);
+    }
+    if out.is_empty() {
+        APP.to_string()
+    } else {
+        out
+    }
+}
+
 fn main() {
     let args = match parse_args() {
         Ok(args) => args,
@@ -352,15 +402,34 @@ fn main() {
         unicode: !args.ascii,
     };
     let sampler = Sampler::new(Duration::from_secs_f64(args.interval));
+    let raw_title = args.title.clone().unwrap_or_else(default_title);
+    let title = display_title(&raw_title);
     install_panic_hook();
 
     let result = if args.once {
-        run_once(sampler, &args, &glyphs, color)
+        run_once(sampler, &args, &glyphs, color, &title)
     } else {
-        run_live(sampler, &args, &glyphs, color)
+        run_live(sampler, &args, &glyphs, color, &title)
     };
     if let Err(error) = result {
         eprintln!("{APP} : {error}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn display_title_is_bounded() {
+        let long = "x".repeat(80);
+        assert!(display_title(&long).width() <= 28);
+    }
+
+    #[test]
+    fn display_title_strips_controls_and_falls_back() {
+        assert_eq!(display_title("a\nb"), "ab");
+        assert_eq!(display_title("   "), APP);
     }
 }

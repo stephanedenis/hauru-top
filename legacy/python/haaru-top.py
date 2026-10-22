@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""hauru-top — tableau de bord terminal de la station Hauru.
+"""hauru-top — tableau de bord terminal pour station Linux.
 
 But
 ---
@@ -37,7 +37,7 @@ Dépendances
 Python 3.10+, le paquet `rich` et `ctypes` (stdlib)
 pour NVML. Aucun autre paquet.
 
-Un portage Rust autonome vit dans `hauru-top-rs/` : même
+La version active (Rust) vit à la racine du dépôt : même
 rendu, mêmes options, binaire sans Python ni `rich` (voir son README).
 
 Mode d'emploi
@@ -48,18 +48,17 @@ Mode d'emploi
 
 Touches : `q` quitter, `p` pause, `r` remettre l'historique à zéro.
 
-Notes Hauru
------------
-* 2 × Xeon E5-2687W v3 : 20 cœurs physiques, 40 threads. Les frères SMT sont
-  lus dans `topology/thread_siblings_list` (0/20, 1/21, …, 10/30, …) et non
-  codés en dur.
-* 2 × Quadro RTX 5000 (16 Gio chacune), reliées par un lien NVLink de
-  25,781 Go/s. Le lien PCIe descend en Gen1 au repos et remonte en Gen3.
-* La carte AMD (Radeon HD 7750) est suivie pour la température, la VRAM, les
-  horloges et le ventilateur ; son activité n'est pas exposée par
-  `gpu_busy_percent` sur ce noyau.
+Notes de conception
+-------------------
+* Le nombre de sockets, de cœurs et de threads SMT est découvert dans
+  `topology/thread_siblings_list` : aucun matériel n'est codé en dur.
+* Les GPU NVIDIA sont découverts dynamiquement par `nvidia-smi` ; leur nombre
+  et leur modèle n'ont pas à être connus à l'avance.
+* La carte AMD est optionnelle : ses capteurs sont lus dans sysfs/`amdgpu`
+  lorsqu'ils sont exposés par le pilote.
 * L'historique CPU passe en rouge dès qu'un thread atteint 100 % (seuil 99,5 %
   pour tenir compte de l'arrondi d'affichage).
+* `--title` permet de remplacer le nom d'hôte affiché dans l'en-tête.
 """
 
 from __future__ import annotations
@@ -72,6 +71,7 @@ import os
 import re
 import select
 import shutil
+import socket
 import signal
 import subprocess
 import sys
@@ -97,6 +97,17 @@ except ModuleNotFoundError:  # pragma: no cover - message destiné à l'utilisat
 
 APP = "hauru-top"
 VERSION = "1.2.1"
+MAX_TITLE = 28
+
+
+def display_title(text: str) -> str:
+    """Nettoie et borne le nom affiché dans l'en-tête."""
+    clean = "".join(ch for ch in text if ch.isprintable()).strip()
+    if not clean:
+        clean = socket.gethostname() or APP
+    while clean and cell_len(clean) > MAX_TITLE:
+        clean = clean[:-1]
+    return clean or APP
 
 # Un thread est considéré à 100 % dès que l'affichage arrondi donne 100 %.
 SATURATED_THRESHOLD = 99.5
@@ -847,7 +858,7 @@ class Amd:
 
 
 def read_nvlink() -> NvLink:
-    """État, vitesse et erreurs NVLink ; le débit n'est pas exposé sur Turing."""
+    """État, vitesse et erreurs NVLink ; le débit dépend du GPU et du pilote."""
     exe = shutil.which("nvidia-smi")
     if not exe:
         return NvLink(speed_gbps=None, links=0, errors=0)
@@ -878,16 +889,13 @@ def read_nvlink() -> NvLink:
 
 
 def read_qpi(topology: Topology) -> Qpi:
-    """Topologie QPI connue ; le débit exige perf et des privilèges."""
+    """Topologie QPI générique ; le débit exige perf et des privilèges."""
     links: Optional[int] = None
     speed: Optional[float] = None
-    if "E5-2687W v3" in topology.model:
-        links = 2
-        speed = 9.6
-    if links is None:
-        reason = "modèle inconnu"
-    elif shutil.which("perf") is None:
-        reason = "perf absent"
+    # Le noyau n'expose pas la topologie QPI/UPI de façon portable. On affiche
+    # seulement le nombre de sockets et on explique l'absence de détail.
+    if shutil.which("perf") is None:
+        reason = "topologie QPI non exposée (perf absent)"
     else:
         try:
             paranoid = int(
@@ -895,7 +903,11 @@ def read_qpi(topology: Topology) -> Qpi:
             )
         except (OSError, ValueError):
             paranoid = 2
-        reason = "perf restreint" if paranoid > 1 else "intégration perf non faite"
+        reason = (
+            "topologie QPI non exposée (perf restreint)"
+            if paranoid > 1
+            else "topologie QPI non exposée"
+        )
     return Qpi(
         sockets=len(topology.packages),
         links=links,
@@ -905,11 +917,11 @@ def read_qpi(topology: Topology) -> Qpi:
     )
 
 
-AMD_NAMES = {"1002:683f": "Radeon HD 7750"}
+AMD_NAMES = {}
 
 
 class AmdReader:
-    """Carte AMD pilotée par amdgpu : température, VRAM, horloges, ventilateur."""
+    """Carte AMD suivie via amdgpu/sysfs : capteurs disponibles seulement."""
 
     def __init__(self) -> None:
         self.device: Optional[Path] = None
@@ -1267,7 +1279,7 @@ def details_line(parts: Sequence[tuple[str, Optional[str]]], width: int) -> Text
     return out
 
 
-def header_block(m: Metrics, width: int, clock: str, dot_style: str) -> list[Text]:
+def header_block(m: Metrics, width: int, clock: str, dot_style: str, title: str) -> list[Text]:
     content_w = width - 4
     gap = 3
     budget = max(20, (content_w - 2 * gap) // 3)
@@ -1324,16 +1336,16 @@ def header_block(m: Metrics, width: int, clock: str, dot_style: str) -> list[Tex
         row2.append_text(pad_to(detail, budget))
     pad_to(row2, content_w)
 
-    title = Text()
-    title.append(GLYPH["dot"], style=dot_style)
-    title.append(" HAURU", style=f"bold {TITLE}")
+    title_line = Text()
+    title_line.append(GLYPH["dot"], style=dot_style)
+    title_line.append(f" {display_title(title)}", style=f"bold {TITLE}")
     right_candidates = [
         Text(f"{clock}  ·  charge {m.load[0]:.2f}  ·  up {fmt_uptime(m.uptime)}", style=DIM),
         Text(f"{clock}  ·  charge {m.load[0]:.2f}", style=DIM),
         Text(clock, style=DIM),
     ]
-    right = choose(right_candidates, width - 2 - cell_len(title.plain) - 8)
-    return card(width, 4, title, right, [row1, row2])
+    right = choose(right_candidates, width - 2 - cell_len(title_line.plain) - 8)
+    return card(width, 4, title_line, right, [row1, row2])
 
 
 def cpu_card(socket: int, m: Metrics, topology: Topology, width: int) -> list[Text]:
@@ -1864,6 +1876,7 @@ def build_frame(
     width: int,
     height: int,
     paused: bool = False,
+    title: str = "hauru-top",
 ) -> Text:
     if width < MIN_WIDTH or height < MIN_HEIGHT:
         lines = too_small(width, height)
@@ -1877,7 +1890,7 @@ def build_frame(
         blocks: list[list[Text]] = []
         gpu_error = m.gpu_error is not None
         dot = ORANGE if (gpu_error or not m.gpus) else GREEN
-        blocks.append(header_block(m, width, clock, dot))
+        blocks.append(header_block(m, width, clock, dot, title))
 
         half_left = (width - 2) // 2
         half_right = width - 2 - half_left
@@ -2003,7 +2016,7 @@ def poll_key(timeout: float) -> Optional[str]:
     return data.decode("utf-8", errors="ignore")
 
 
-def run_live(sampler: Sampler, console: Console) -> int:
+def run_live(sampler: Sampler, console: Console, title: str) -> int:
     import termios
     import tty
 
@@ -2025,7 +2038,7 @@ def run_live(sampler: Sampler, console: Console) -> int:
 
     try:
         sampler.prime()
-        frame = build_frame(sampler, console.size.width, console.size.height, paused)
+        frame = build_frame(sampler, console.size.width, console.size.height, paused, title)
         with Live(
             frame,
             console=console,
@@ -2037,7 +2050,7 @@ def run_live(sampler: Sampler, console: Console) -> int:
             while not stop:
                 size = console.size
                 live.update(
-                    build_frame(sampler, size.width, size.height, paused),
+                    build_frame(sampler, size.width, size.height, paused, title),
                     refresh=True,
                 )
                 next_tick += sampler.interval
@@ -2055,7 +2068,7 @@ def run_live(sampler: Sampler, console: Console) -> int:
                             sampler.reset_cpu_baseline()
                         live.update(
                             build_frame(
-                                sampler, size.width, size.height, paused
+                                sampler, size.width, size.height, paused, title
                             ),
                             refresh=True,
                         )
@@ -2065,7 +2078,7 @@ def run_live(sampler: Sampler, console: Console) -> int:
                         sampler.samples = 0
                         live.update(
                             build_frame(
-                                sampler, size.width, size.height, paused
+                                sampler, size.width, size.height, paused, title
                             ),
                             refresh=True,
                         )
@@ -2130,6 +2143,10 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="bordures, barres et sparklines en ASCII (texte accentué conservé)",
     )
     parser.add_argument(
+        "--title", default=None,
+        help="nom affiché dans l'en-tête (défaut : nom d'hôte)",
+    )
+    parser.add_argument(
         "--version", action="version", version=f"{APP} {VERSION}",
     )
     args = parser.parse_args(argv)
@@ -2144,6 +2161,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
+    title = display_title(args.title or socket.gethostname())
 
     encoding = (sys.stdout.encoding or "").lower()
     unicode_ok = (not args.ascii) and ("utf" in encoding)
@@ -2193,13 +2211,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.once:
         sampler.prime()
         size = console.size
-        frame = build_frame(sampler, size.width, size.height, paused=False)
+        frame = build_frame(sampler, size.width, size.height, paused=False, title=title)
         console.print(frame)
         if sampler.metrics and sampler.metrics.gpu_error:
             print(f"{APP}: {sampler.metrics.gpu_error}", file=sys.stderr)
         return 0
 
-    return run_live(sampler, console)
+    return run_live(sampler, console, title)
 
 
 if __name__ == "__main__":
