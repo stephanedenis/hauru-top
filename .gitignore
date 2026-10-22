@@ -1,0 +1,7 @@
+target/
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+vue.txt
+.DS_Store

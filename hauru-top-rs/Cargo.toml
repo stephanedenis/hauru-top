@@ -1,0 +1,23 @@
+[package]
+name = "hauru-top"
+version = "1.2.1"
+edition = "2021"
+description = "Tableau de bord terminal pour la station Hauru (portage Rust)"
+license = "MIT"
+authors = ["Stéphane Denis"]
+repository = "https://github.com/stephanedenis/hauru-top"
+homepage = "https://github.com/stephanedenis/hauru-top"
+publish = false
+
+[dependencies]
+crossterm = "0.28"
+libloading = "0.8"
+libc = "0.2"
+signal-hook = "0.3"
+unicode-width = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true

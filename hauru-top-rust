@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# hauru-top-rust — lance la version Rust de hauru-top, en la compilant au besoin.
+#
+# But : éviter de retenir le chemin du binaire et recompiler automatiquement la
+# première fois. Le projet Cargo vit dans hauru-top-rs/.
+# Effets de bord : écrit target/ (ignoré par git) lors de la première compilation.
+# Aucun privilège root n'est nécessaire.
+
+set -euo pipefail
+
+DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)/hauru-top-rs"
+BIN="$DIR/target/release/hauru-top"
+
+if [ ! -x "$BIN" ]; then
+    echo "hauru-top (rust) : compilation initiale..." >&2
+    (cd "$DIR" && cargo build --release)
+fi
+
+exec "$BIN" "$@"
