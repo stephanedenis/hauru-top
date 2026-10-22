@@ -102,6 +102,7 @@ hauru-top --title "mon-serveur"
 | Donnée | Source |
 | --- | --- |
 | Charge par thread | delta de `/proc/stat` |
+| Processus | `/proc/<pid>/{stat,statm,cmdline}` et `nvidia-smi --query-compute-apps` |
 | Sockets, cœurs, threads SMT | `/sys/devices/system/cpu/*/topology/` |
 | Fréquences | `cpufreq/scaling_cur_freq` |
 | Températures CPU | `hwmon/coretemp` et capteurs disponibles |
