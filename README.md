@@ -125,6 +125,9 @@ sont simplement indiqués `n/a`, sans interrompre le tableau de bord.
 ## Limites connues
 
 - Linux uniquement (lecture de `/proc` et `/sys`, `nvidia-smi`, NVML).
+- L'interface est optimisée pour une ou deux sockets CPU et jusqu'à deux GPU
+  NVIDIA ; les cartes supplémentaires sont détectées mais ne disposent pas
+  encore d'une carte dédiée.
 - Les capteurs dépendent du matériel et du pilote : certains GPU, cartes AMD ou
   CPU n'exposent pas toutes les mesures. L'interface affiche `n/a` le cas
   échéant.
