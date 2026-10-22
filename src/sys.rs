@@ -1,10 +1,13 @@
 //! Lecture de `/proc`, `/sys` et de `nvidia-smi`, puis agrégation des métriques.
 
-use crate::model::{Amd, Core, Gpu, History, Metrics, NvLink, Qpi, Topology};
+use crate::model::{
+    Amd, Core, Gpu, History, Metrics, NvLink, Process, ProcessTable, Qpi, Topology,
+};
 use libloading::Library;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::c_void;
 use std::fs;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -372,6 +375,141 @@ fn run_with_timeout(
     child.wait_with_output().map_err(|error| error.to_string())
 }
 
+struct GpuProcess {
+    pid: u32,
+    name: String,
+    mem_bytes: u64,
+}
+
+fn clock_ticks() -> f64 {
+    let value = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    if value > 0 {
+        value as f64
+    } else {
+        100.0
+    }
+}
+
+fn memory_page_size() -> u64 {
+    let value = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if value > 0 {
+        value as u64
+    } else {
+        4096
+    }
+}
+
+fn read_user_map() -> HashMap<u32, String> {
+    let mut users = HashMap::new();
+    if let Ok(content) = fs::read_to_string("/etc/passwd") {
+        for line in content.lines() {
+            let fields: Vec<&str> = line.split(':').collect();
+            if fields.len() >= 3 {
+                if let Ok(uid) = fields[2].parse::<u32>() {
+                    users.insert(uid, fields[0].to_string());
+                }
+            }
+        }
+    }
+    users
+}
+
+fn read_proc_ticks(path: &Path) -> Option<(u64, String)> {
+    let stat = fs::read_to_string(path.join("stat")).ok()?;
+    let close = stat.rfind(')')?;
+    let open = stat.find('(')?;
+    let comm = stat.get(open + 1..close)?.to_string();
+    let fields: Vec<&str> = stat.get(close + 1..)?.split_whitespace().collect();
+    let utime = fields.get(11)?.parse::<u64>().ok()?;
+    let stime = fields.get(12)?.parse::<u64>().ok()?;
+    Some((utime.saturating_add(stime), comm))
+}
+
+fn read_vm_rss_bytes(path: &Path, page_size: u64) -> u64 {
+    let Ok(statm) = fs::read_to_string(path.join("statm")) else {
+        return 0;
+    };
+    statm
+        .split_whitespace()
+        .nth(1)
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0)
+        .saturating_mul(page_size)
+}
+
+fn clean_process_text(text: &str) -> String {
+    let cleaned: String = text
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect();
+    let joined = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+    joined.chars().take(180).collect()
+}
+
+fn private_command(command: &str) -> String {
+    command
+        .split_whitespace()
+        .next()
+        .and_then(|first| {
+            Path::new(first)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_string)
+                .or_else(|| Some(first.to_string()))
+        })
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "processus".to_string())
+}
+
+fn read_process_command(path: &Path, comm: &str, privacy: bool) -> String {
+    let raw = fs::read(path.join("cmdline")).unwrap_or_default();
+    let args: Vec<String> = raw
+        .split(|byte| *byte == 0)
+        .filter(|part| !part.is_empty())
+        .map(|part| String::from_utf8_lossy(part).into_owned())
+        .collect();
+    if args.is_empty() {
+        clean_process_text(comm)
+    } else if privacy {
+        clean_process_text(&private_command(&args[0]))
+    } else {
+        clean_process_text(&args.join(" "))
+    }
+}
+
+fn read_gpu_processes() -> Vec<GpuProcess> {
+    let mut command = Command::new("nvidia-smi");
+    command.args([
+        "--query-compute-apps=pid,process_name,used_memory",
+        "--format=csv,noheader,nounits",
+    ]);
+    let Ok(output) = run_with_timeout(&mut command, Duration::from_secs(2)) else {
+        return Vec::new();
+    };
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut processes = Vec::new();
+    for line in text.lines() {
+        let fields: Vec<&str> = line.split(',').map(str::trim).collect();
+        if fields.len() < 3 {
+            continue;
+        }
+        let Ok(pid) = fields[0].parse::<u32>() else {
+            continue;
+        };
+        let mem_mib = fields[2].parse::<f64>().unwrap_or(0.0).max(0.0);
+        if mem_mib <= 0.0 {
+            continue;
+        }
+        processes.push(GpuProcess {
+            pid,
+            name: clean_process_text(fields[1]),
+            mem_bytes: (mem_mib * 1024.0 * 1024.0) as u64,
+        });
+    }
+    processes.sort_by_key(|process| std::cmp::Reverse(process.mem_bytes));
+    processes
+}
+
 type NvmlGetHandle = unsafe extern "C" fn(u32, *mut *mut c_void) -> i32;
 type NvmlGetPcie = unsafe extern "C" fn(*mut c_void, u32, *mut u32) -> i32;
 
@@ -692,10 +830,18 @@ pub struct Sampler {
     amd: AmdReader,
     prev_cpu: Vec<Vec<u64>>,
     temps: PackageTempReader,
+    users: HashMap<u32, String>,
+    proc_prev: HashMap<u32, u64>,
+    proc_last: Option<Instant>,
+    gpu_processes: Vec<GpuProcess>,
+    gpu_processes_tick: u64,
+    clock_ticks: f64,
+    page_size: u64,
+    privacy: bool,
 }
 
 impl Sampler {
-    pub fn new(interval: Duration) -> Self {
+    pub fn new(interval: Duration, privacy: bool) -> Self {
         let topology = detect_topology();
         let qpi = read_qpi(&topology);
         let nvlink = read_nvlink();
@@ -714,16 +860,144 @@ impl Sampler {
             amd,
             prev_cpu: read_cpu_times(),
             temps: PackageTempReader::new(),
+            users: read_user_map(),
+            proc_prev: HashMap::new(),
+            proc_last: None,
+            gpu_processes: Vec::new(),
+            gpu_processes_tick: 0,
+            clock_ticks: clock_ticks(),
+            page_size: memory_page_size(),
+            privacy,
         }
     }
 
     /// Reprend une référence CPU propre (après une pause prolongée).
     pub fn reset_cpu_baseline(&mut self) {
         self.prev_cpu = read_cpu_times();
+        self.proc_prev.clear();
+        self.proc_last = None;
+    }
+
+    fn read_processes(&mut self, ram_total: u64) -> ProcessTable {
+        let now = Instant::now();
+        let elapsed = self
+            .proc_last
+            .map(|previous| now.duration_since(previous).as_secs_f64())
+            .unwrap_or(0.0);
+        let gpu_by_pid: HashMap<u32, u64> = self
+            .gpu_processes
+            .iter()
+            .map(|process| (process.pid, process.mem_bytes))
+            .collect();
+        let mut current = HashMap::new();
+        let mut all: Vec<Process> = Vec::new();
+
+        if let Ok(entries) = fs::read_dir("/proc") {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let Some(pid) = name.to_str().and_then(|value| value.parse::<u32>().ok()) else {
+                    continue;
+                };
+                let path = PathBuf::from("/proc").join(pid.to_string());
+                let Some((ticks, comm)) = read_proc_ticks(&path) else {
+                    continue;
+                };
+                let cpu_pct = if elapsed > 0.001 {
+                    self.proc_prev
+                        .get(&pid)
+                        .map(|previous| {
+                            ticks.saturating_sub(*previous) as f64 * 100.0
+                                / (self.clock_ticks * elapsed)
+                        })
+                        .unwrap_or(0.0)
+                } else {
+                    0.0
+                };
+                let rss_bytes = read_vm_rss_bytes(&path, self.page_size);
+                let mem_pct = if ram_total > 0 {
+                    100.0 * rss_bytes as f64 / ram_total as f64
+                } else {
+                    0.0
+                };
+                let uid = fs::metadata(&path).map(|meta| meta.uid()).unwrap_or(0);
+                let user = if self.privacy {
+                    "user".to_string()
+                } else {
+                    self.users
+                        .get(&uid)
+                        .cloned()
+                        .unwrap_or_else(|| uid.to_string())
+                };
+                let command = read_process_command(&path, &comm, self.privacy);
+                current.insert(pid, ticks);
+                all.push(Process {
+                    pid,
+                    user,
+                    command,
+                    cpu_pct: cpu_pct.max(0.0),
+                    mem_pct,
+                    rss_bytes,
+                    gpu_mem_bytes: gpu_by_pid.get(&pid).copied().unwrap_or(0),
+                });
+            }
+        }
+
+        // Un processus GPU peut être invisible dans /proc (conteneur) : on garde
+        // au moins son PID, son nom et sa mémoire GPU.
+        for gpu in &self.gpu_processes {
+            if !current.contains_key(&gpu.pid) {
+                all.push(Process {
+                    pid: gpu.pid,
+                    user: if self.privacy {
+                        "user".into()
+                    } else {
+                        "?".into()
+                    },
+                    command: if self.privacy {
+                        private_command(&gpu.name)
+                    } else {
+                        gpu.name.clone()
+                    },
+                    cpu_pct: 0.0,
+                    mem_pct: 0.0,
+                    rss_bytes: 0,
+                    gpu_mem_bytes: gpu.mem_bytes,
+                });
+            }
+        }
+
+        self.proc_prev = current;
+        self.proc_last = Some(now);
+
+        let mut by_cpu = all.clone();
+        by_cpu.sort_by(|a, b| {
+            b.cpu_pct
+                .total_cmp(&a.cpu_pct)
+                .then_with(|| b.rss_bytes.cmp(&a.rss_bytes))
+        });
+        let mut by_mem = all.clone();
+        by_mem.sort_by_key(|process| std::cmp::Reverse(process.rss_bytes));
+        let mut by_gpu: Vec<Process> = all
+            .into_iter()
+            .filter(|process| process.gpu_mem_bytes > 0)
+            .collect();
+        by_gpu.sort_by_key(|process| std::cmp::Reverse(process.gpu_mem_bytes));
+
+        let total = by_cpu.len().max(by_mem.len());
+        ProcessTable {
+            top_cpu: by_cpu.into_iter().take(12).collect(),
+            top_mem: by_mem.into_iter().take(12).collect(),
+            top_gpu: by_gpu.into_iter().take(4).collect(),
+            total,
+        }
     }
 
     /// Attend une demi-seconde puis prend la première mesure utile.
     pub fn prime(&mut self) {
+        // Référence processus immédiate : la première frame affiche déjà des
+        // pourcentages CPU au lieu de zéros.
+        self.gpu_processes_tick = 0;
+        let _ = self.read_processes(0);
         thread::sleep(Duration::from_millis(500));
         self.sample(true);
     }
@@ -756,6 +1030,10 @@ impl Sampler {
 
         let (gpus, gpu_error, gpu_latency) = read_gpus(&mut self.nvml);
         self.gpu_latency_ms = gpu_latency;
+        self.gpu_processes_tick = self.gpu_processes_tick.wrapping_add(1);
+        if self.gpu_processes_tick % 5 == 1 {
+            self.gpu_processes = read_gpu_processes();
+        }
         if record && self.samples.is_multiple_of(10) {
             self.nvlink = read_nvlink();
         }
@@ -769,6 +1047,7 @@ impl Sampler {
                 + mem.get("Cached").copied().unwrap_or(0)
         });
         let ram_used = ram_total.saturating_sub(ram_available);
+        let processes = self.read_processes(ram_total);
         let swap_total = *mem.get("SwapTotal").unwrap_or(&0);
         let swap_used = swap_total.saturating_sub(*mem.get("SwapFree").unwrap_or(&0));
 
@@ -892,6 +1171,7 @@ impl Sampler {
             nvlink: self.nvlink.clone(),
             qpi: self.qpi.clone(),
             amd,
+            processes,
         });
     }
 }

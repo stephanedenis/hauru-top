@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const APP: &str = "hauru-top";
-const VERSION: &str = "1.2.1";
+const VERSION: &str = "1.3.0";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ColorChoice {
@@ -33,6 +33,7 @@ struct Args {
     color: ColorChoice,
     ascii: bool,
     title: Option<String>,
+    privacy: bool,
 }
 
 impl Default for Args {
@@ -45,6 +46,7 @@ impl Default for Args {
             color: ColorChoice::Auto,
             ascii: false,
             title: None,
+            privacy: false,
         }
     }
 }
@@ -62,6 +64,7 @@ fn print_help() {
          \x20       --color <MODE>         auto, always ou never\n\
          \x20       --ascii               bordures et barres en ASCII\n\
          \x20       --title <NOM>         nom affiché (défaut : nom d'hôte)\n\
+         \x20       --privacy             masque utilisateurs et arguments\n\
          \x20   -h, --help                cette aide\n\
          \x20       --version             version\n\n\
          TOUCHES:\n\
@@ -88,6 +91,7 @@ fn parse_args() -> Result<Args, String> {
             }
             "--once" => args.once = true,
             "--ascii" => args.ascii = true,
+            "--privacy" => args.privacy = true,
             "--title" => {
                 args.title = Some(
                     inline
@@ -401,7 +405,7 @@ fn main() {
     let glyphs = Glyphs {
         unicode: !args.ascii,
     };
-    let sampler = Sampler::new(Duration::from_secs_f64(args.interval));
+    let sampler = Sampler::new(Duration::from_secs_f64(args.interval), args.privacy);
     let raw_title = args.title.clone().unwrap_or_else(default_title);
     let title = display_title(&raw_title);
     install_panic_hook();

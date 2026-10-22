@@ -1,12 +1,13 @@
 # hauru-top
 
 Tableau de bord système pour le terminal Linux : charge CPU par cœur physique,
-mémoire, GPU NVIDIA, capteurs, historique et interconnexions — le tout dans une
-interface couleur adaptative, avec un binaire natif en Rust.
+mémoire, GPU NVIDIA, processus, capteurs, historique et interconnexions — le
+tout dans une interface couleur adaptative, avec un binaire natif en Rust.
 
 ![Aperçu de hauru-top](docs/screenshot.png)
 
-> Capture d’exemple ; le nom affiché est personnalisable avec `--title`.
+> Capture d’exemple anonymisée avec `--privacy` ; le nom affiché est
+> personnalisable avec `--title`.
 
 ## Fonctionnalités
 
@@ -20,6 +21,9 @@ interface couleur adaptative, avec un binaire natif en Rust.
   température, ventilateur et horloges.
 - Panneau **LIAISONS** : débits PCIe TX/RX par lien via NVML, état et vitesse
   NVLink, topologie QPI/UPI, activité tensor si disponible, capteurs AMD/amdgpu.
+- Panneau **PROCESSUS** : top CPU/RAM/GPU avec PID, utilisateur, CPU %, mémoire,
+  RSS, VRAM et ligne de commande. Les processus à 100 % d'un cœur sont en rouge
+  et rappelés dans le pied de page.
 - Historique sparkline pour CPU, GPU, RAM et VRAM ; alerte rouge dès qu'un
   thread atteint la saturation.
 - Couleurs 24 bits, 256 couleurs ou 16 couleurs ; `NO_COLOR` respecté ; mode
@@ -29,7 +33,8 @@ interface couleur adaptative, avec un binaire natif en Rust.
 - Aucun privilège root nécessaire ; terminal restauré sur `q`, `Ctrl+C`,
   SIGTERM et SIGHUP.
 - Nom affiché dans l'en-tête configurable avec `--title` (nom d'hôte par
-  défaut).
+  défaut) et mode `--privacy` pour masquer les utilisateurs et les arguments de
+  commande (utile pour les captures).
 
 ## Installation
 
@@ -39,7 +44,7 @@ Téléchargez l'archive de la [dernière release](https://github.com/stephaneden
 (`x86_64-unknown-linux-gnu`), puis :
 
 ```bash
-tar -xzf hauru-top-1.2.1-x86_64-unknown-linux-gnu.tar.gz
+tar -xzf hauru-top-1.3.0-x86_64-unknown-linux-gnu.tar.gz
 sudo install -m 755 hauru-top /usr/local/bin/
 hauru-top --version
 ```
@@ -81,6 +86,7 @@ hauru-top --title "mon-serveur"
 | `--color auto\|always\|never` | Mode couleur |
 | `--ascii` | Bordures, barres et sparklines en ASCII |
 | `--title <nom>` | Nom affiché dans l'en-tête (nom d'hôte par défaut) |
+| `--privacy` | Masque les noms d'utilisateur et les arguments de commande |
 | `-h`, `--help` | Aide |
 | `--version` | Version |
 
@@ -108,6 +114,11 @@ hauru-top --title "mon-serveur"
 Le nombre de sockets, de GPU et de capteurs est variable. Les éléments absents
 sont simplement indiqués `n/a`, sans interrompre le tableau de bord.
 
+Les pourcentages CPU des processus suivent la convention « un cœur = 100 % » :
+un processus multi-thread peut donc dépasser 100 % (par exemple 400 % pour
+quatre cœurs saturés). Les processus à 100 % ou plus sont mis en évidence en
+rouge.
+
 ## Rendu et adaptation
 
 - Les sockets détectés sont côte à côte (un seul socket occupe toute la
@@ -117,6 +128,9 @@ sont simplement indiqués `n/a`, sans interrompre le tableau de bord.
   le relais ou se réduit selon la place disponible.
 - Taille minimale : 76 × 22. En dessous, un message indique la taille requise
   et `q` reste actif.
+- Le panneau PROCESSUS apparaît à partir de 33 lignes ; en dessous, une alerte
+  de saturation (PID, utilisateur, CPU, commande) reste affichée dans le pied
+  de page. `--privacy` s'applique aussi à cette alerte.
 - Les barres PCIe utilisent une échelle logarithmique (1 Mo/s à 10 Go/s) et
   affichent les débits exacts ; il ne s'agit pas d'un pourcentage de capacité.
 - Le thème est prévu pour un fond sombre ; `NO_COLOR` et `--color never`

@@ -1,7 +1,8 @@
 //! Rendu du tableau de bord : palette, lignes stylées, cartes et sérialisation ANSI.
 
-use crate::model::{Gpu, Metrics};
-use crate::sys::Sampler;
+use crate::model::{Gpu, Metrics, Process, ProcessTable};
+use crate::sys::{Sampler, SATURATED_THRESHOLD};
+use std::collections::HashMap;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 pub const MIN_WIDTH: usize = 76;
@@ -1342,6 +1343,139 @@ fn links_block(m: &Metrics, width: usize, glyphs: &Glyphs) -> Vec<Line> {
     card(width, 7, &title, Some(&right), rows, glyphs)
 }
 
+fn fmt_process_mem(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = 1024.0 * 1024.0;
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    let value = bytes as f64;
+    if value >= GIB {
+        format!("{:.1}G", value / GIB)
+    } else if value >= MIB {
+        format!("{:.0}M", value / MIB)
+    } else if value >= KIB {
+        format!("{:.0}K", value / KIB)
+    } else if bytes > 0 {
+        format!("{bytes}B")
+    } else {
+        "-".to_string()
+    }
+}
+
+/// Sélectionne un top commun : d'abord les processus CPU saturés, puis le haut
+/// des classements CPU, RAM et GPU. Les doublons sont fusionnés par PID.
+fn select_processes(table: &ProcessTable, limit: usize) -> Vec<Process> {
+    let mut best: HashMap<u32, (usize, Process)> = HashMap::new();
+    let mut consider = |process: &Process, rank: usize| {
+        let score = if process.cpu_pct >= SATURATED_THRESHOLD {
+            0
+        } else {
+            rank + 1
+        };
+        match best.entry(process.pid) {
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert((score, process.clone()));
+            }
+            std::collections::hash_map::Entry::Occupied(mut slot) => {
+                if score < slot.get().0 {
+                    slot.insert((score, process.clone()));
+                }
+            }
+        }
+    };
+    for (rank, process) in table.top_cpu.iter().enumerate() {
+        consider(process, rank);
+    }
+    for (rank, process) in table.top_mem.iter().enumerate() {
+        consider(process, rank);
+    }
+    for (rank, process) in table.top_gpu.iter().enumerate() {
+        consider(process, rank);
+    }
+    let mut ranked: Vec<(usize, Process)> = best.into_values().collect();
+    // Le score sert à garantir un représentant du top CPU, RAM et GPU ; le
+    // classement final reste lisible comme un top CPU (pourcentages décroissants).
+    ranked.sort_by(|a, b| {
+        b.1.cpu_pct
+            .total_cmp(&a.1.cpu_pct)
+            .then_with(|| a.0.cmp(&b.0))
+            .then_with(|| b.1.rss_bytes.cmp(&a.1.rss_bytes))
+    });
+    ranked.into_iter().take(limit).map(|(_, p)| p).collect()
+}
+
+fn process_header(content_width: usize, show_gpu: bool) -> Line {
+    let mut text = format!(
+        "{:<6} {:<9} {:>6} {:>6} {:>7} ",
+        "PID", "USER", "CPU", "MEM", "RSS"
+    );
+    if show_gpu {
+        text.push_str(&format!("{:>6} ", "GPU"));
+    }
+    text.push_str("COMMANDE");
+    Line::from_text(&fit(&text, content_width), Style::fg(DIM))
+}
+
+fn process_row(process: &Process, content_width: usize, show_gpu: bool) -> Line {
+    let saturated = process.cpu_pct >= SATURATED_THRESHOLD;
+    let cpu = format!("{:.0}%", process.cpu_pct.min(9999.0));
+    let mem = format!("{:.1}%", process.mem_pct.min(100.0));
+    let mut text = format!(
+        "{:<6} {:<9} {:>6} {:>6} {:>7} ",
+        process.pid,
+        fit(&process.user, 9),
+        cpu,
+        mem,
+        fmt_process_mem(process.rss_bytes)
+    );
+    if show_gpu {
+        text.push_str(&format!("{:>6} ", fmt_process_mem(process.gpu_mem_bytes)));
+    }
+    let used = UnicodeWidthStr::width(text.as_str());
+    let command_width = content_width.saturating_sub(used);
+    text.push_str(&fit(&process.command, command_width));
+    let mut line = Line::from_text(
+        &fit(&text, content_width),
+        if saturated {
+            Style::strong(RED)
+        } else {
+            Style::fg(TEXT)
+        },
+    );
+    line.pad_to(content_width);
+    line
+}
+
+fn process_block(m: &Metrics, width: usize, height: usize, glyphs: &Glyphs) -> Vec<Line> {
+    let content_width = width.saturating_sub(4);
+    let rows = height.saturating_sub(3);
+    let selected = select_processes(&m.processes, rows);
+    let show_gpu = width >= 110 && !m.processes.top_gpu.is_empty();
+    let saturated = m
+        .processes
+        .top_cpu
+        .iter()
+        .filter(|process| process.cpu_pct >= SATURATED_THRESHOLD)
+        .count();
+
+    let mut body = Vec::new();
+    if selected.is_empty() {
+        body.push(Line::from_text("aucun processus lisible", Style::fg(DIM)));
+    } else {
+        body.push(process_header(content_width, show_gpu));
+        for process in selected {
+            body.push(process_row(&process, content_width, show_gpu));
+        }
+    }
+
+    let title = Line::from_text("PROCESSUS", Style::strong(TITLE));
+    let right = if saturated > 0 {
+        Line::from_text(&format!("! {saturated} à 100%"), Style::strong(RED))
+    } else {
+        Line::from_text(&format!("{} proc", m.processes.total), Style::fg(DIM))
+    };
+    card(width, height, &title, Some(&right), body, glyphs)
+}
+
 fn footer_block(
     width: usize,
     m: &Metrics,
@@ -1364,7 +1498,26 @@ fn footer_block(
     left.push("r", Style::strong(TEXT));
     left.push(" reset", Style::fg(DIM));
 
-    let mut right = if let Some(error) = &m.gpu_error {
+    let saturated = m
+        .processes
+        .top_cpu
+        .iter()
+        .find(|process| process.cpu_pct >= SATURATED_THRESHOLD);
+    let mut right = if let Some(process) = saturated {
+        Line::from_text(
+            &fit(
+                &format!(
+                    "! {} {} {:.0}%  {}",
+                    process.pid,
+                    fit(&process.user, 10),
+                    process.cpu_pct,
+                    process.command
+                ),
+                10.max(width / 2),
+            ),
+            Style::strong(RED),
+        )
+    } else if let Some(error) = &m.gpu_error {
         let message = if error.to_lowercase().starts_with("nvidia-smi") {
             error.clone()
         } else {
@@ -1381,7 +1534,7 @@ fn footer_block(
         )
     };
     let mut gap = width as i64 - left.width() as i64 - right.width() as i64;
-    if gap <= 0 && m.gpu_error.is_none() {
+    if gap <= 0 && m.gpu_error.is_none() && saturated.is_none() {
         right = Line::from_text(
             &format!("{:.1} s · {:.0} ms", interval, gpu_ms),
             Style::fg(DIM),
@@ -1487,29 +1640,34 @@ pub fn build_frame(
             blocks.push(gpu_placeholder(width, gpu_height, &message, glyphs));
         }
 
-        let links_height = if height >= 33 { 7 } else { 0 };
+        // Le top des processus est prioritaire sur l'historique, qui reste un
+        // complément lorsque la fenêtre est assez haute.
+        let process_height = if height >= 35 {
+            9
+        } else if height >= 33 {
+            7
+        } else {
+            0
+        };
+        if process_height > 0 {
+            blocks.push(process_block(m, width, process_height, glyphs));
+        }
+
+        let links_height = if height >= 43 { 7 } else { 0 };
         if links_height > 0 {
             blocks.push(links_block(m, width, glyphs));
         }
 
-        let base_height = blocks.iter().map(Vec::len).sum::<usize>() + 1;
-        let reserved_gaps = if links_height > 0 { 5 } else { 4 };
-        let max_history = height as isize - base_height as isize - reserved_gaps as isize;
-        let history_rows = if max_history >= 8 {
-            6
-        } else if max_history >= 7 {
-            5
-        } else if max_history >= 6 {
-            4
-        } else if max_history >= 5 {
-            3
-        } else if max_history >= 4 {
-            2
-        } else if max_history >= 3 {
-            1
-        } else {
-            0
-        };
+        let base_sum = blocks.iter().map(Vec::len).sum::<usize>();
+        let base_count = blocks.len();
+        let mut history_rows = 0;
+        for rows in (1..=6).rev() {
+            let total = base_sum + rows + 2 + 1 + base_count;
+            if total <= height {
+                history_rows = rows;
+                break;
+            }
+        }
         if history_rows > 0 {
             blocks.push(history_block(m, sampler, width, history_rows, glyphs));
         }
@@ -1764,6 +1922,38 @@ mod tests {
         for width in 0..20 {
             assert!(UnicodeWidthStr::width(fit("abcdefghijklmnop", width).as_str()) <= width);
         }
+    }
+
+    #[test]
+    fn top_processes_merge_cpu_memory_and_gpu() {
+        let make = |pid, cpu, rss, gpu| crate::model::Process {
+            pid,
+            user: "user".into(),
+            command: format!("proc{pid}"),
+            cpu_pct: cpu,
+            mem_pct: 0.0,
+            rss_bytes: rss,
+            gpu_mem_bytes: gpu,
+        };
+        let table = crate::model::ProcessTable {
+            top_cpu: vec![make(1, 120.0, 10, 0), make(2, 40.0, 20, 0)],
+            top_mem: vec![make(3, 1.0, 900, 0)],
+            top_gpu: vec![make(4, 0.0, 30, 800)],
+            total: 4,
+        };
+        let selected = select_processes(&table, 4);
+        let pids: Vec<u32> = selected.iter().map(|p| p.pid).collect();
+        assert!(pids.contains(&1) && pids.contains(&3) && pids.contains(&4));
+        assert_eq!(pids[0], 1);
+        assert_eq!(selected.len(), 4);
+    }
+
+    #[test]
+    fn process_memory_format_is_compact() {
+        assert_eq!(fmt_process_mem(0), "-");
+        assert_eq!(fmt_process_mem(1536), "2K");
+        assert_eq!(fmt_process_mem(5 * 1024 * 1024), "5M");
+        assert_eq!(fmt_process_mem(3 * 1024 * 1024 * 1024), "3.0G");
     }
 
     #[test]

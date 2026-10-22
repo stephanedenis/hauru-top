@@ -101,6 +101,27 @@ pub struct Amd {
     pub busy: Option<f64>,
 }
 
+/// Un processus, avec ses consommations CPU/RAM/GPU.
+#[derive(Clone, Debug, Default)]
+pub struct Process {
+    pub pid: u32,
+    pub user: String,
+    pub command: String,
+    pub cpu_pct: f64,
+    pub mem_pct: f64,
+    pub rss_bytes: u64,
+    pub gpu_mem_bytes: u64,
+}
+
+/// Les meilleurs processus par ressource.
+#[derive(Clone, Debug, Default)]
+pub struct ProcessTable {
+    pub top_cpu: Vec<Process>,
+    pub top_mem: Vec<Process>,
+    pub top_gpu: Vec<Process>,
+    pub total: usize,
+}
+
 /// Toutes les métriques d'une frame.
 #[derive(Clone, Debug, Default)]
 pub struct Metrics {
@@ -125,6 +146,7 @@ pub struct Metrics {
     pub nvlink: NvLink,
     pub qpi: Qpi,
     pub amd: Option<Amd>,
+    pub processes: ProcessTable,
 }
 
 /// Historique borné à 600 échantillons (~10 min à 1 Hz).
